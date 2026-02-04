@@ -100,7 +100,102 @@ static syscall_hooker_func_t call_hook = &call_orig_syscall;
 		"ret\n\t");
 }
 #elif defined(__aarch64__)
-// TODO: implement syscall trace trampoline
+/*
+ARM64 syscall ABI:
+- x8:  syscall number
+- x0-x5: arguments
+- x0: return value
+
+ARM64 C calling convention:
+- x0-x7: arguments
+- x0: return value
+- x30 (LR): return address
+- x29 (FP): frame pointer
+
+When we replace `svc #0` with `bl <trampoline>`, x30 contains the return address.
+*/
+
+// Global trampoline address for ARM64 (set during setup)
+static void *g_arm64_trampoline_addr = nullptr;
+
+[[maybe_unused]] void __asm_holder()
+{
+	// syscall_hooker_asm: Entry point from bl instruction
+	// x30 has return address (set by bl instruction)
+	// x8 has syscall number, x0-x5 have arguments
+	__asm__(
+		".globl syscall_hooker_asm\n\t"
+		"syscall_hooker_asm:\n\t"
+		// Check for rt_sigreturn (syscall 139 on ARM64)
+		"cmp x8, #139\n\t"
+		"b.eq handle_sigreturn\n\t"
+
+		// Save frame pointer and link register
+		"stp x29, x30, [sp, #-16]!\n\t"
+		"mov x29, sp\n\t"
+
+		// Save callee-saved registers we'll use
+		"stp x19, x20, [sp, #-16]!\n\t"
+		"stp x21, x22, [sp, #-16]!\n\t"
+
+		// Save syscall arguments (x0-x5) and syscall number (x8)
+		"stp x0, x1, [sp, #-16]!\n\t"
+		"stp x2, x3, [sp, #-16]!\n\t"
+		"stp x4, x5, [sp, #-16]!\n\t"
+		"str x8, [sp, #-16]!\n\t"
+
+		// Convert syscall ABI to C ABI for syscall_hooker_cxx:
+		// C ABI: x0=syscall_nr, x1=arg1, x2=arg2, x3=arg3, x4=arg4, x5=arg5, x6=arg6
+		// Note: arg6 (original x5) goes to x6
+		"mov x6, x5\n\t"  // arg6
+		"mov x5, x4\n\t"  // arg5
+		"mov x4, x3\n\t"  // arg4
+		"mov x3, x2\n\t"  // arg3
+		"mov x2, x1\n\t"  // arg2
+		"mov x1, x0\n\t"  // arg1
+		"mov x0, x8\n\t"  // syscall_nr
+
+		// Call the C++ hook function
+		"bl syscall_hooker_cxx\n\t"
+
+		// Result is in x0, restore stack
+		"add sp, sp, #16\n\t"       // Skip saved x8
+		"add sp, sp, #16\n\t"       // Skip saved x4, x5
+		"add sp, sp, #16\n\t"       // Skip saved x2, x3
+		"add sp, sp, #16\n\t"       // Skip saved x0, x1
+
+		// Restore callee-saved registers
+		"ldp x21, x22, [sp], #16\n\t"
+		"ldp x19, x20, [sp], #16\n\t"
+
+		// Restore frame pointer and link register
+		"ldp x29, x30, [sp], #16\n\t"
+
+		// Return to caller (x0 has return value)
+		"ret\n\t"
+	);
+
+	// call_orig_syscall: Execute original syscall
+	// C ABI input: x0=syscall_nr, x1=arg1, x2=arg2, x3=arg3, x4=arg4, x5=arg5, x6=arg6
+	__asm__(
+		".globl call_orig_syscall\n\t"
+		"call_orig_syscall:\n\t"
+		// Convert C ABI back to syscall ABI
+		"mov x8, x0\n\t"   // syscall_nr to x8
+		"mov x0, x1\n\t"   // arg1
+		"mov x1, x2\n\t"   // arg2
+		"mov x2, x3\n\t"   // arg3
+		"mov x3, x4\n\t"   // arg4
+		"mov x4, x5\n\t"   // arg5
+		"mov x5, x6\n\t"   // arg6
+
+		"handle_sigreturn:\n\t"
+		".globl syscall_addr\n\t"
+		"syscall_addr:\n\t"
+		"svc #0\n\t"
+		"ret\n\t"
+	);
+}
 #else
 #error "Unsupported architecture"
 #endif
@@ -124,7 +219,11 @@ static inline void rewrite_segment(uint8_t *code, size_t len, int perm)
 	}
 	csh cs_handle;
 	cs_err ret;
+#if defined(__x86_64__)
 	ret = cs_open(CS_ARCH_X86, CS_MODE_64, &cs_handle);
+#elif defined(__aarch64__)
+	ret = cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &cs_handle);
+#endif
 	if (ret != CS_ERR_OK) {
 		SPDLOG_ERROR("Failed to open capstone instance: {}, {}",
 			      (int)ret, cs_strerror(ret));
@@ -143,6 +242,7 @@ static inline void rewrite_segment(uint8_t *code, size_t len, int perm)
 		}
 		auto insn_name =
 			std::string(cs_insn_name(cs_handle, curr_insn.id));
+#if defined(__x86_64__)
 		if (insn_name == "syscall" || insn_name == "sysenter") {
 			if (curr_insn.address != (uintptr_t)&syscall_addr) {
 				uint8_t *curr_pos =
@@ -153,6 +253,46 @@ static inline void rewrite_segment(uint8_t *code, size_t len, int perm)
 				curr_pos[1] = 0xd0;
 			}
 		}
+#elif defined(__aarch64__)
+		if (insn_name == "svc") {
+			// Skip our own svc instruction
+			if (curr_insn.address == (uintptr_t)&syscall_addr) {
+				continue;
+			}
+
+			// Calculate relative offset for bl instruction
+			// bl has a 26-bit signed immediate (in units of 4 bytes)
+			// Range: +/- 128MB (2^25 instructions * 4 bytes)
+			int64_t offset = (int64_t)g_arm64_trampoline_addr -
+					 (int64_t)curr_insn.address;
+			int64_t offset_insns = offset / 4;
+
+			// Check if offset is within bl range (+/- 2^25 instructions)
+			if (offset_insns < -(1 << 25) ||
+			    offset_insns >= (1 << 25)) {
+				SPDLOG_WARN(
+					"svc instruction at {:x} is too far from trampoline ({:x}), skipping",
+					curr_insn.address,
+					(uintptr_t)g_arm64_trampoline_addr);
+				continue;
+			}
+
+			uint8_t *curr_pos =
+				(uint8_t *)(uintptr_t)curr_insn.address;
+			SPDLOG_TRACE("Rewrite svc insn at {}",
+				      (void *)curr_pos);
+
+			// Encode bl instruction: 0x94000000 | (imm26 & 0x03ffffff)
+			uint32_t bl_insn =
+				0x94000000 | (offset_insns & 0x03ffffff);
+
+			// Write the bl instruction (little-endian)
+			curr_pos[0] = (uint8_t)(bl_insn & 0xff);
+			curr_pos[1] = (uint8_t)((bl_insn >> 8) & 0xff);
+			curr_pos[2] = (uint8_t)((bl_insn >> 16) & 0xff);
+			curr_pos[3] = (uint8_t)((bl_insn >> 24) & 0xff);
+		}
+#endif
 	}
 	cs_close(&cs_handle);
 	if (int err = mprotect(code, len, perm); err < 0) {
@@ -192,7 +332,8 @@ void set_call_hook(syscall_hooker_func_t hook)
 
 void setup_syscall_tracer()
 {
-	// Setup page mappings
+#if defined(__x86_64__)
+	// x86_64: Setup zpoline (NOP sled at page 0)
 
 	if (auto mmap_addr =
 		    mmap(0x0, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
@@ -244,8 +385,95 @@ void setup_syscall_tracer()
 	}
 
 	SPDLOG_INFO("Page zero setted up..");
-	// Scan for /proc/self/maps
 
+#elif defined(__aarch64__)
+	// ARM64: Allocate a trampoline page and use direct bl instructions
+	// The zpoline technique (NOP sled at address 0) doesn't work on ARM64
+	// because instructions are 4 bytes and must be aligned.
+	// Instead, we allocate a trampoline page and replace svc #0 with
+	// bl <trampoline>.
+
+	// Try to allocate trampoline near 4GB boundary for good reach
+	// bl instruction has +/- 128MB range, so placing near middle of
+	// address space helps reach more code
+	void *hint_addr = (void *)0x100000000ULL; // 4GB
+	void *trampoline_page = mmap(
+		hint_addr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (trampoline_page == MAP_FAILED) {
+		// Try without hint
+		trampoline_page =
+			mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+			     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (trampoline_page == MAP_FAILED) {
+			SPDLOG_ERROR(
+				"Failed to allocate ARM64 trampoline page: errno={}, message={}",
+				errno, strerror(errno));
+			exit(1);
+		}
+	}
+
+	SPDLOG_INFO("ARM64 trampoline page allocated at {:x}",
+		     (uintptr_t)trampoline_page);
+
+	// Build trampoline code:
+	// Optional: bti c (for BTI-enabled binaries)
+	// Load syscall_hooker_asm address into x16 using MOVZ/MOVK
+	// br x16
+	uint32_t *trampoline_code = (uint32_t *)trampoline_page;
+	uint64_t handler_addr = (uint64_t)(uintptr_t)syscall_hooker_asm;
+	int idx = 0;
+
+	// BTI landing pad for indirect branches (bti c)
+	// Encoding: 0xd503245f
+	trampoline_code[idx++] = 0xd503245f;
+
+	// movz x16, #<bits 0-15>
+	// Encoding: 0xd2800010 | (imm16 << 5)
+	trampoline_code[idx++] =
+		0xd2800010 | ((handler_addr & 0xffff) << 5);
+
+	// movk x16, #<bits 16-31>, lsl #16
+	// Encoding: 0xf2a00010 | (imm16 << 5)
+	trampoline_code[idx++] =
+		0xf2a00010 | (((handler_addr >> 16) & 0xffff) << 5);
+
+	// movk x16, #<bits 32-47>, lsl #32
+	// Encoding: 0xf2c00010 | (imm16 << 5)
+	trampoline_code[idx++] =
+		0xf2c00010 | (((handler_addr >> 32) & 0xffff) << 5);
+
+	// movk x16, #<bits 48-63>, lsl #48
+	// Encoding: 0xf2e00010 | (imm16 << 5)
+	trampoline_code[idx++] =
+		0xf2e00010 | (((handler_addr >> 48) & 0xffff) << 5);
+
+	// br x16
+	// Encoding: 0xd61f0200
+	trampoline_code[idx++] = 0xd61f0200;
+
+	// Store trampoline address globally
+	g_arm64_trampoline_addr = trampoline_page;
+
+	// Clear instruction cache for the trampoline
+	__builtin___clear_cache((char *)trampoline_page,
+				(char *)trampoline_page + idx * 4);
+
+	// Make trampoline read-execute only
+	if (int err = mprotect(trampoline_page, 0x1000, PROT_READ | PROT_EXEC);
+	    err < 0) {
+		SPDLOG_ERROR(
+			"Failed to set ARM64 trampoline page permissions: {}",
+			errno);
+		exit(1);
+	}
+
+	SPDLOG_INFO("ARM64 trampoline set up at {:x}, handler at {:x}",
+		     (uintptr_t)trampoline_page, handler_addr);
+#endif
+
+	// Scan for /proc/self/maps
 	std::vector<MapEntry> entries;
 	std::ifstream ifs("/proc/self/maps");
 	while (ifs) {
@@ -275,10 +503,18 @@ void setup_syscall_tracer()
 	// Hack the executable mappings
 	for (const auto &map : entries) {
 		if (map.x == 'x') {
+#if defined(__x86_64__)
 			if (map.begin == 0) {
 				// Skip pages that we mapped
 				continue;
 			}
+#elif defined(__aarch64__)
+			// Skip the trampoline page we allocated
+			if ((uintptr_t)g_arm64_trampoline_addr >= map.begin &&
+			    (uintptr_t)g_arm64_trampoline_addr < map.end) {
+				continue;
+			}
+#endif
 			SPDLOG_DEBUG("Rewriting segment from {:x} to {:x}",
 				      map.begin, map.end);
 			rewrite_segment((uint8_t *)(uintptr_t)(map.begin),
