@@ -230,6 +230,25 @@ static inline long raw_mprotect(void *addr, size_t len, int prot)
 		"mov x2, x1\n\t"
 		"mov x1, x0\n\t"
 		"mov x0, x8\n\t"
+		// Save FPSIMD registers - kernel svc preserves all 128 bits of q0-q31,
+		// but our C call may clobber q0-q7, upper bits of q8-q15, and q16-q31.
+		// Save all 32 for complete transparency. Cost: 512 bytes stack, ~32 cycles.
+		"stp q0, q1, [sp, #-32]!\n\t"
+		"stp q2, q3, [sp, #-32]!\n\t"
+		"stp q4, q5, [sp, #-32]!\n\t"
+		"stp q6, q7, [sp, #-32]!\n\t"
+		"stp q8, q9, [sp, #-32]!\n\t"
+		"stp q10, q11, [sp, #-32]!\n\t"
+		"stp q12, q13, [sp, #-32]!\n\t"
+		"stp q14, q15, [sp, #-32]!\n\t"
+		"stp q16, q17, [sp, #-32]!\n\t"
+		"stp q18, q19, [sp, #-32]!\n\t"
+		"stp q20, q21, [sp, #-32]!\n\t"
+		"stp q22, q23, [sp, #-32]!\n\t"
+		"stp q24, q25, [sp, #-32]!\n\t"
+		"stp q26, q27, [sp, #-32]!\n\t"
+		"stp q28, q29, [sp, #-32]!\n\t"
+		"stp q30, q31, [sp, #-32]!\n\t"
 		// Save NZCV condition flags - kernel svc preserves them, C call may clobber
 		"mrs x8, nzcv\n\t"
 		"str x8, [sp, #-16]!\n\t"
@@ -238,6 +257,23 @@ static inline long raw_mprotect(void *addr, size_t len, int prot)
 		// Restore NZCV condition flags
 		"ldr x8, [sp], #16\n\t"
 		"msr nzcv, x8\n\t"
+		// Restore FPSIMD registers (reverse order)
+		"ldp q30, q31, [sp], #32\n\t"
+		"ldp q28, q29, [sp], #32\n\t"
+		"ldp q26, q27, [sp], #32\n\t"
+		"ldp q24, q25, [sp], #32\n\t"
+		"ldp q22, q23, [sp], #32\n\t"
+		"ldp q20, q21, [sp], #32\n\t"
+		"ldp q18, q19, [sp], #32\n\t"
+		"ldp q16, q17, [sp], #32\n\t"
+		"ldp q14, q15, [sp], #32\n\t"
+		"ldp q12, q13, [sp], #32\n\t"
+		"ldp q10, q11, [sp], #32\n\t"
+		"ldp q8, q9, [sp], #32\n\t"
+		"ldp q6, q7, [sp], #32\n\t"
+		"ldp q4, q5, [sp], #32\n\t"
+		"ldp q2, q3, [sp], #32\n\t"
+		"ldp q0, q1, [sp], #32\n\t"
 		// Restore x1-x8 (kernel svc preserves them, so must we).
 		// x0 is the return value from C handler; keep it, skip saved x0.
 		"ldr x8, [sp], #16\n\t" // restore x8 (syscall number)
