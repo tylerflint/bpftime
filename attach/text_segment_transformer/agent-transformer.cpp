@@ -47,7 +47,13 @@ extern "C" int __libc_start_main(int (*main)(int, char **, char **), int argc,
 
 extern "C" void bpftime_agent_main(const gchar *data, gboolean *stay_resident)
 {
-	auto logger = spdlog::stderr_color_mt("stderr");
+	// Use spdlog's named "stderr" logger if it already exists (e.g., created
+	// by the agent), otherwise create it. This avoids a duplicate-name crash
+	// when the agent is loaded in the same namespace.
+	auto logger = spdlog::get("stderr");
+	if (!logger) {
+		logger = spdlog::stderr_color_mt("stderr");
+	}
 	spdlog::set_default_logger(logger);
 	spdlog::cfg::load_env_levels();
 	/* We don't want to our library to be unloaded after we return. */
@@ -70,10 +76,26 @@ extern "C" void bpftime_agent_main(const gchar *data, gboolean *stay_resident)
 		return;
 	}
 	SPDLOG_DEBUG("Using agent {}", agent_so);
+#if defined(__x86_64__)
 	cs_arch_register_x86();
+#elif defined(__aarch64__)
+	cs_arch_register_arm64();
+#endif
 	bpftime::setup_syscall_tracer();
 	SPDLOG_DEBUG("Loading dynamic library..");
-	auto next_handle = dlmopen(LM_ID_NEWLM, agent_so, RTLD_NOW | RTLD_LOCAL);
+	// RTLD_DEEPBIND: agent resolves its own symbols first (e.g.,
+	// bpftime_agent_main) before falling back to the global scope.
+	// This prevents the agent's internal bpftime_agent_main call from
+	// resolving to the transformer's version (which would cause infinite
+	// recursion on agent init).
+	//
+	// Why not dlmopen(LM_ID_NEWLM)? dlmopen creates a separate link-map
+	// namespace which gets its own TLS block. This works for the main thread,
+	// but threads created by Go's runtime (via clone with CLONE_SETTLS) get
+	// Go-managed TLS. The separate namespace's TLS is never initialized on
+	// those threads, so __thread accesses from the agent would fault.
+	// dlopen with RTLD_DEEPBIND shares the same TLS across all threads.
+	auto next_handle = dlopen(agent_so, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
 	if (next_handle == nullptr) {
 		SPDLOG_ERROR("Failed to open agent: {}", dlerror());
 		exit(1);
